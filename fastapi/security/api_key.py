@@ -196,8 +196,57 @@ class APIKeyHeader(APIKeyBase):
         self.auto_error = auto_error
 
     async def __call__(self, request: Request) -> Optional[str]:
-        api_key = request.headers.get(self.model.name)
-        return self.check_api_key(api_key, self.auto_error)
+        from fastapi.observability.config import METRICS_AUTH
+        from fastapi.observability.metrics import statsd
+        import time
+
+        # Get route and header name for tagging
+        route_path = request.scope.get("route", {}).get("path", "unknown") if hasattr(request.scope.get("route", {}), "get") else "unknown"
+        header_name = self.model.name
+
+        tags = [
+            f"path:{route_path}",
+            f"header:{header_name}",
+            f"scheme:api_key"
+        ]
+
+        start_time = time.time()
+        if METRICS_AUTH:
+            statsd.increment("auth.api_key.count", tags=tags)
+
+        try:
+            api_key = request.headers.get(self.model.name)
+
+            if not api_key:
+                # Track missing API key
+                if METRICS_AUTH:
+                    failure_tags = tags + [
+                        f"failure_reason:missing",
+                        f"auto_error:{self.auto_error}"
+                    ]
+                    statsd.increment("auth.api_key.failures", tags=failure_tags)
+
+            result = self.check_api_key(api_key, self.auto_error)
+
+            # Track successful API key extraction
+            if result and METRICS_AUTH:
+                statsd.increment("auth.api_key.success", tags=tags)
+
+            return result
+
+        except HTTPException:
+            raise  # Already tracked above
+
+        except Exception as e:
+            if METRICS_AUTH:
+                error_tags = tags + [f"error_type:{type(e).__name__}"]
+                statsd.increment("auth.api_key.errors", tags=error_tags)
+            raise
+
+        finally:
+            if METRICS_AUTH:
+                duration = time.time() - start_time
+                statsd.histogram("auth.api_key.latency", duration, tags=tags)
 
 
 class APIKeyCookie(APIKeyBase):

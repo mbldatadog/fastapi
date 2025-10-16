@@ -486,18 +486,62 @@ class OAuth2PasswordBearer(OAuth2):
         )
 
     async def __call__(self, request: Request) -> Optional[str]:
-        authorization = request.headers.get("Authorization")
-        scheme, param = get_authorization_scheme_param(authorization)
-        if not authorization or scheme.lower() != "bearer":
-            if self.auto_error:
-                raise HTTPException(
-                    status_code=HTTP_401_UNAUTHORIZED,
-                    detail="Not authenticated",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            else:
-                return None
-        return param
+        from fastapi.observability.config import METRICS_AUTH
+        from fastapi.observability.metrics import statsd
+        import time
+
+        # Get route information for tagging
+        route_path = request.scope.get("route", {}).get("path", "unknown") if hasattr(request.scope.get("route", {}), "get") else "unknown"
+        tags = [
+            f"path:{route_path}",
+            f"scheme:oauth2_bearer"
+        ]
+
+        start_time = time.time()
+        if METRICS_AUTH:
+            statsd.increment("auth.oauth2.count", tags=tags)
+
+        try:
+            authorization = request.headers.get("Authorization")
+            scheme, param = get_authorization_scheme_param(authorization)
+
+            if not authorization or scheme.lower() != "bearer":
+                # Track authentication failures
+                failure_reason = "missing" if not authorization else "invalid_scheme"
+                if METRICS_AUTH:
+                    failure_tags = tags + [
+                        f"failure_reason:{failure_reason}",
+                        f"auto_error:{self.auto_error}"
+                    ]
+                    statsd.increment("auth.oauth2.failures", tags=failure_tags)
+
+                if self.auto_error:
+                    raise HTTPException(
+                        status_code=HTTP_401_UNAUTHORIZED,
+                        detail="Not authenticated",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                else:
+                    return None
+
+            # Track successful token extraction
+            if METRICS_AUTH:
+                statsd.increment("auth.oauth2.success", tags=tags)
+            return param
+
+        except HTTPException:
+            raise  # Already tracked above
+
+        except Exception as e:
+            if METRICS_AUTH:
+                error_tags = tags + [f"error_type:{type(e).__name__}"]
+                statsd.increment("auth.oauth2.errors", tags=error_tags)
+            raise
+
+        finally:
+            if METRICS_AUTH:
+                duration = time.time() - start_time
+                statsd.histogram("auth.oauth2.latency", duration, tags=tags)
 
 
 class OAuth2AuthorizationCodeBearer(OAuth2):

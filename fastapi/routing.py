@@ -228,53 +228,101 @@ async def serialize_response(
     exclude_none: bool = False,
     is_coroutine: bool = True,
 ) -> Any:
-    if field:
-        errors = []
-        if not hasattr(field, "serialize"):
-            # pydantic v1
-            response_content = _prepare_response_content(
-                response_content,
-                exclude_unset=exclude_unset,
-                exclude_defaults=exclude_defaults,
-                exclude_none=exclude_none,
-            )
-        if is_coroutine:
-            value, errors_ = field.validate(response_content, {}, loc=("response",))
+    from fastapi.observability.config import METRICS_SERIALIZATION
+    from fastapi.observability.metrics import statsd
+    import time
+    import sys
+
+    # Determine response type for tagging
+    response_type = type(response_content).__name__
+    has_response_model = field is not None
+
+    tags = [
+        f"response_type:{response_type}",
+        f"has_model:{has_response_model}"
+    ]
+
+    start_time = time.time()
+    if METRICS_SERIALIZATION:
+        statsd.increment("serialize_response.count", tags=tags)
+
+    try:
+        if field:
+            errors = []
+            if not hasattr(field, "serialize"):
+                # pydantic v1
+                response_content = _prepare_response_content(
+                    response_content,
+                    exclude_unset=exclude_unset,
+                    exclude_defaults=exclude_defaults,
+                    exclude_none=exclude_none,
+                )
+            if is_coroutine:
+                value, errors_ = field.validate(response_content, {}, loc=("response",))
+            else:
+                value, errors_ = await run_in_threadpool(
+                    field.validate, response_content, {}, loc=("response",)
+                )
+            if isinstance(errors_, list):
+                errors.extend(errors_)
+            elif errors_:
+                errors.append(errors_)
+            if errors:
+                # Track validation errors
+                if METRICS_SERIALIZATION:
+                    error_tags = tags + [f"error_count:{len(errors)}"]
+                    statsd.increment("serialize_response.validation_errors", tags=error_tags)
+                raise ResponseValidationError(
+                    errors=_normalize_errors(errors), body=response_content
+                )
+
+            if hasattr(field, "serialize"):
+                result = field.serialize(
+                    value,
+                    include=include,
+                    exclude=exclude,
+                    by_alias=by_alias,
+                    exclude_unset=exclude_unset,
+                    exclude_defaults=exclude_defaults,
+                    exclude_none=exclude_none,
+                )
+            else:
+                result = jsonable_encoder(
+                    value,
+                    include=include,
+                    exclude=exclude,
+                    by_alias=by_alias,
+                    exclude_unset=exclude_unset,
+                    exclude_defaults=exclude_defaults,
+                    exclude_none=exclude_none,
+                )
+
+            # Track response size
+            if METRICS_SERIALIZATION:
+                response_size = sys.getsizeof(result)
+                statsd.histogram("serialize_response.size", response_size, tags=tags)
+
+            return result
         else:
-            value, errors_ = await run_in_threadpool(
-                field.validate, response_content, {}, loc=("response",)
-            )
-        if isinstance(errors_, list):
-            errors.extend(errors_)
-        elif errors_:
-            errors.append(errors_)
-        if errors:
-            raise ResponseValidationError(
-                errors=_normalize_errors(errors), body=response_content
-            )
+            result = jsonable_encoder(response_content)
+            if METRICS_SERIALIZATION:
+                response_size = sys.getsizeof(result)
+                statsd.histogram("serialize_response.size", response_size, tags=tags)
+            return result
 
-        if hasattr(field, "serialize"):
-            return field.serialize(
-                value,
-                include=include,
-                exclude=exclude,
-                by_alias=by_alias,
-                exclude_unset=exclude_unset,
-                exclude_defaults=exclude_defaults,
-                exclude_none=exclude_none,
-            )
+    except ResponseValidationError:
+        raise  # Already tracked above
 
-        return jsonable_encoder(
-            value,
-            include=include,
-            exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-        )
-    else:
-        return jsonable_encoder(response_content)
+    except Exception as e:
+        if METRICS_SERIALIZATION:
+            error_tags = tags + [f"error_type:{type(e).__name__}"]
+            statsd.increment("serialize_response.errors", tags=error_tags)
+        raise
+
+    finally:
+        if METRICS_SERIALIZATION:
+            duration = time.time() - start_time
+            statsd.histogram("serialize_response.latency", duration, tags=tags)
 
 
 async def run_endpoint_function(
@@ -282,12 +330,44 @@ async def run_endpoint_function(
 ) -> Any:
     # Only called by get_request_handler. Has been split into its own function to
     # facilitate profiling endpoints, since inner functions are harder to profile.
-    assert dependant.call is not None, "dependant.call must be a function"
+    from fastapi.observability.config import METRICS_REQUEST_HANDLER
+    from fastapi.observability.metrics import statsd
+    import time
 
-    if is_coroutine:
-        return await dependant.call(**values)
-    else:
-        return await run_in_threadpool(dependant.call, **values)
+    # Get endpoint name for tagging
+    endpoint_name = "unknown"
+    if dependant.call:
+        endpoint_name = f"{dependant.call.__module__}.{dependant.call.__name__}"
+
+    tags = [
+        f"endpoint:{endpoint_name}",
+        f"is_coroutine:{is_coroutine}"
+    ]
+
+    start_time = time.time()
+    if METRICS_REQUEST_HANDLER:
+        statsd.increment("endpoint_execution.count", tags=tags)
+
+    try:
+        assert dependant.call is not None, "dependant.call must be a function"
+
+        if is_coroutine:
+            result = await dependant.call(**values)
+        else:
+            result = await run_in_threadpool(dependant.call, **values)
+
+        return result
+
+    except Exception as e:
+        if METRICS_REQUEST_HANDLER:
+            error_tags = tags + [f"error_type:{type(e).__name__}"]
+            statsd.increment("endpoint_execution.errors", tags=error_tags)
+        raise
+
+    finally:
+        if METRICS_REQUEST_HANDLER:
+            duration = time.time() - start_time
+            statsd.histogram("endpoint_execution.latency", duration, tags=tags)
 
 
 def get_request_handler(
@@ -316,6 +396,21 @@ def get_request_handler(
         actual_response_class = response_class
 
     async def app(request: Request) -> Response:
+        # Import metrics utilities
+        from fastapi.observability.config import METRICS_REQUEST_HANDLER
+        from fastapi.observability.metrics import statsd
+        import time
+
+        # Extract route information for tags
+        route_path = request.scope.get("route", {}).get("path", "unknown") if hasattr(request.scope.get("route", {}), "get") else "unknown"
+        method = request.method
+        tags = [f"path:{route_path}", f"method:{method}"]
+
+        # Start timing and increment request counter
+        start_time = time.time()
+        if METRICS_REQUEST_HANDLER:
+            statsd.increment("request_handler.count", tags=tags)
+
         response: Union[Response, None] = None
         file_stack = request.scope.get("fastapi_middleware_astack")
         assert isinstance(file_stack, AsyncExitStack), (
@@ -371,67 +466,110 @@ def get_request_handler(
             raise http_error from e
 
         # Solve dependencies and run path operation function, auto-closing dependencies
-        errors: List[Any] = []
-        async_exit_stack = request.scope.get("fastapi_inner_astack")
-        assert isinstance(async_exit_stack, AsyncExitStack), (
-            "fastapi_inner_astack not found in request scope"
-        )
-        solved_result = await solve_dependencies(
-            request=request,
-            dependant=dependant,
-            body=body,
-            dependency_overrides_provider=dependency_overrides_provider,
-            async_exit_stack=async_exit_stack,
-            embed_body_fields=embed_body_fields,
-        )
-        errors = solved_result.errors
-        if not errors:
-            raw_response = await run_endpoint_function(
-                dependant=dependant,
-                values=solved_result.values,
-                is_coroutine=is_coroutine,
+        try:
+            errors: List[Any] = []
+            async_exit_stack = request.scope.get("fastapi_inner_astack")
+            assert isinstance(async_exit_stack, AsyncExitStack), (
+                "fastapi_inner_astack not found in request scope"
             )
-            if isinstance(raw_response, Response):
-                if raw_response.background is None:
-                    raw_response.background = solved_result.background_tasks
-                response = raw_response
-            else:
-                response_args: Dict[str, Any] = {
-                    "background": solved_result.background_tasks
-                }
-                # If status_code was set, use it, otherwise use the default from the
-                # response class, in the case of redirect it's 307
-                current_status_code = (
-                    status_code if status_code else solved_result.response.status_code
-                )
-                if current_status_code is not None:
-                    response_args["status_code"] = current_status_code
-                if solved_result.response.status_code:
-                    response_args["status_code"] = solved_result.response.status_code
-                content = await serialize_response(
-                    field=response_field,
-                    response_content=raw_response,
-                    include=response_model_include,
-                    exclude=response_model_exclude,
-                    by_alias=response_model_by_alias,
-                    exclude_unset=response_model_exclude_unset,
-                    exclude_defaults=response_model_exclude_defaults,
-                    exclude_none=response_model_exclude_none,
+            solved_result = await solve_dependencies(
+                request=request,
+                dependant=dependant,
+                body=body,
+                dependency_overrides_provider=dependency_overrides_provider,
+                async_exit_stack=async_exit_stack,
+                embed_body_fields=embed_body_fields,
+            )
+            errors = solved_result.errors
+            if not errors:
+                raw_response = await run_endpoint_function(
+                    dependant=dependant,
+                    values=solved_result.values,
                     is_coroutine=is_coroutine,
                 )
-                response = actual_response_class(content, **response_args)
-                if not is_body_allowed_for_status_code(response.status_code):
-                    response.body = b""
-                response.headers.raw.extend(solved_result.response.headers.raw)
-        if errors:
-            validation_error = RequestValidationError(
-                _normalize_errors(errors), body=body
-            )
-            raise validation_error
+                if isinstance(raw_response, Response):
+                    if raw_response.background is None:
+                        raw_response.background = solved_result.background_tasks
+                    response = raw_response
+                else:
+                    response_args: Dict[str, Any] = {
+                        "background": solved_result.background_tasks
+                    }
+                    # If status_code was set, use it, otherwise use the default from the
+                    # response class, in the case of redirect it's 307
+                    current_status_code = (
+                        status_code if status_code else solved_result.response.status_code
+                    )
+                    if current_status_code is not None:
+                        response_args["status_code"] = current_status_code
+                    if solved_result.response.status_code:
+                        response_args["status_code"] = solved_result.response.status_code
+                    content = await serialize_response(
+                        field=response_field,
+                        response_content=raw_response,
+                        include=response_model_include,
+                        exclude=response_model_exclude,
+                        by_alias=response_model_by_alias,
+                        exclude_unset=response_model_exclude_unset,
+                        exclude_defaults=response_model_exclude_defaults,
+                        exclude_none=response_model_exclude_none,
+                        is_coroutine=is_coroutine,
+                    )
+                    response = actual_response_class(content, **response_args)
+                    if not is_body_allowed_for_status_code(response.status_code):
+                        response.body = b""
+                    response.headers.raw.extend(solved_result.response.headers.raw)
+            if errors:
+                validation_error = RequestValidationError(
+                    _normalize_errors(errors), body=body
+                )
+                raise validation_error
 
-        # Return response
-        assert response
-        return response
+            # Return response
+            assert response
+
+            # Track successful response with status code
+            if METRICS_REQUEST_HANDLER and response:
+                status_tags = tags + [f"status_code:{response.status_code}"]
+                statsd.increment("request_handler.success", tags=status_tags)
+
+            return response
+
+        except HTTPException as e:
+            # Track HTTP exceptions
+            if METRICS_REQUEST_HANDLER:
+                error_tags = tags + [
+                    f"error_type:HTTPException",
+                    f"status_code:{e.status_code}"
+                ]
+                statsd.increment("request_handler.errors", tags=error_tags)
+            raise
+
+        except RequestValidationError as e:
+            # Track validation errors
+            if METRICS_REQUEST_HANDLER:
+                error_tags = tags + [
+                    f"error_type:RequestValidationError",
+                    f"status_code:422"
+                ]
+                statsd.increment("request_handler.errors", tags=error_tags)
+            raise
+
+        except Exception as e:
+            # Track unexpected errors
+            if METRICS_REQUEST_HANDLER:
+                error_tags = tags + [
+                    f"error_type:{type(e).__name__}",
+                    f"status_code:500"
+                ]
+                statsd.increment("request_handler.errors", tags=error_tags)
+            raise
+
+        finally:
+            # Record request latency
+            if METRICS_REQUEST_HANDLER:
+                duration = time.time() - start_time
+                statsd.histogram("request_handler.latency", duration, tags=tags)
 
     return app
 

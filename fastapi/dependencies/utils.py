@@ -282,50 +282,95 @@ def get_dependant(
     security_scopes: Optional[List[str]] = None,
     use_cache: bool = True,
 ) -> Dependant:
-    path_param_names = get_path_param_names(path)
-    endpoint_signature = get_typed_signature(call)
-    signature_params = endpoint_signature.parameters
-    dependant = Dependant(
-        call=call,
-        name=name,
-        path=path,
-        security_scopes=security_scopes,
-        use_cache=use_cache,
-    )
-    for param_name, param in signature_params.items():
-        is_path_param = param_name in path_param_names
-        param_details = analyze_param(
-            param_name=param_name,
-            annotation=param.annotation,
-            value=param.default,
-            is_path_param=is_path_param,
+    from fastapi.observability.config import METRICS_DEPENDENCIES
+    from fastapi.observability.metrics import statsd
+    import time
+
+    # Get function info for tagging
+    func_name = f"{call.__module__}.{call.__name__}" if hasattr(call, "__name__") else "unknown"
+
+    tags = [
+        f"function:{func_name}",
+        f"use_cache:{use_cache}"
+    ]
+
+    start_time = time.time()
+    if METRICS_DEPENDENCIES:
+        statsd.increment("get_dependant.count", tags=tags)
+
+    try:
+        path_param_names = get_path_param_names(path)
+        endpoint_signature = get_typed_signature(call)
+        signature_params = endpoint_signature.parameters
+        dependant = Dependant(
+            call=call,
+            name=name,
+            path=path,
+            security_scopes=security_scopes,
+            use_cache=use_cache,
         )
-        if param_details.depends is not None:
-            sub_dependant = get_param_sub_dependant(
+
+        param_count = len(signature_params)
+        dependency_count = 0
+
+        for param_name, param in signature_params.items():
+            is_path_param = param_name in path_param_names
+            param_details = analyze_param(
                 param_name=param_name,
-                depends=param_details.depends,
-                path=path,
-                security_scopes=security_scopes,
+                annotation=param.annotation,
+                value=param.default,
+                is_path_param=is_path_param,
             )
-            dependant.dependencies.append(sub_dependant)
-            continue
-        if add_non_field_param_to_dependency(
-            param_name=param_name,
-            type_annotation=param_details.type_annotation,
-            dependant=dependant,
-        ):
-            assert param_details.field is None, (
-                f"Cannot specify multiple FastAPI annotations for {param_name!r}"
-            )
-            continue
-        assert param_details.field is not None
-        if isinstance(
-            param_details.field.field_info, (params.Body, temp_pydantic_v1_params.Body)
-        ):
-            dependant.body_params.append(param_details.field)
-        else:
-            add_param_to_fields(field=param_details.field, dependant=dependant)
-    return dependant
+            if param_details.depends is not None:
+                dependency_count += 1
+                sub_dependant = get_param_sub_dependant(
+                    param_name=param_name,
+                    depends=param_details.depends,
+                    path=path,
+                    security_scopes=security_scopes,
+                )
+                dependant.dependencies.append(sub_dependant)
+                continue
+            if add_non_field_param_to_dependency(
+                param_name=param_name,
+                type_annotation=param_details.type_annotation,
+                dependant=dependant,
+            ):
+                assert param_details.field is None, (
+                    f"Cannot specify multiple FastAPI annotations for {param_name!r}"
+                )
+                continue
+            assert param_details.field is not None
+            if isinstance(
+                param_details.field.field_info, (params.Body, temp_pydantic_v1_params.Body)
+            ):
+                dependant.body_params.append(param_details.field)
+            else:
+                add_param_to_fields(field=param_details.field, dependant=dependant)
+
+        # Track complexity metrics
+        if METRICS_DEPENDENCIES:
+            complexity_tags = tags + [
+                f"param_count:{param_count}",
+                f"dependency_count:{dependency_count}",
+                f"body_param_count:{len(dependant.body_params)}"
+            ]
+            statsd.gauge("get_dependant.complexity",
+                        param_count + dependency_count,
+                        tags=complexity_tags)
+
+        return dependant
+
+    except Exception as e:
+        if METRICS_DEPENDENCIES:
+            error_tags = tags + [f"error_type:{type(e).__name__}"]
+            statsd.increment("get_dependant.errors", tags=error_tags)
+        raise
+
+    finally:
+        if METRICS_DEPENDENCIES:
+            duration = time.time() - start_time
+            statsd.histogram("get_dependant.latency", duration, tags=tags)
 
 
 def add_non_field_param_to_dependency(
@@ -615,6 +660,25 @@ async def solve_dependencies(
     async_exit_stack: AsyncExitStack,
     embed_body_fields: bool,
 ) -> SolvedDependency:
+    from fastapi.observability.config import METRICS_DEPENDENCIES
+    from fastapi.observability.metrics import statsd
+    import time
+
+    # Get route path for tagging
+    route_path = "unknown"
+    if hasattr(request, "scope"):
+        route = request.scope.get("route", {})
+        if hasattr(route, "get"):
+            route_path = route.get("path", "unknown")
+
+    # Track dependency count
+    dep_count = len(dependant.dependencies)
+    tags = [f"path:{route_path}", f"dependency_count:{dep_count}"]
+
+    start_time = time.time()
+    if METRICS_DEPENDENCIES:
+        statsd.increment("solve_dependencies.count", tags=tags)
+
     values: Dict[str, Any] = {}
     errors: List[Any] = []
     if response is None:
@@ -720,6 +784,22 @@ async def solve_dependencies(
         values[dependant.security_scopes_param_name] = SecurityScopes(
             scopes=dependant.security_scopes
         )
+
+    # Track cache size and validation errors
+    if METRICS_DEPENDENCIES:
+        if dependency_cache:
+            cache_size = len(dependency_cache)
+            statsd.gauge("solve_dependencies.cache_size", cache_size, tags=tags)
+
+        if errors:
+            error_count = len(errors)
+            error_tags = tags + [f"error_count:{error_count}"]
+            statsd.increment("solve_dependencies.validation_errors", tags=error_tags)
+
+        # Record latency
+        duration = time.time() - start_time
+        statsd.histogram("solve_dependencies.latency", duration, tags=tags)
+
     return SolvedDependency(
         values=values,
         errors=errors,
@@ -775,79 +855,122 @@ def request_params_to_args(
     fields: Sequence[ModelField],
     received_params: Union[Mapping[str, Any], QueryParams, Headers],
 ) -> Tuple[Dict[str, Any], List[Any]]:
-    values: Dict[str, Any] = {}
-    errors: List[Dict[str, Any]] = []
+    from fastapi.observability.config import METRICS_DEPENDENCIES
+    from fastapi.observability.metrics import statsd
+    import time
 
-    if not fields:
+    # Determine parameter location
+    param_location = "query"
+    if isinstance(received_params, Headers):
+        param_location = "headers"
+
+    field_count = len(fields)
+    tags = [
+        f"param_location:{param_location}",
+        f"field_count:{field_count}"
+    ]
+
+    start_time = time.time()
+    if METRICS_DEPENDENCIES:
+        statsd.increment("request_params_to_args.count", tags=tags)
+
+    try:
+        values: Dict[str, Any] = {}
+        errors: List[Dict[str, Any]] = []
+
+        if not fields:
+            return values, errors
+
+        first_field = fields[0]
+        fields_to_extract = fields
+        single_not_embedded_field = False
+        default_convert_underscores = True
+        if len(fields) == 1 and lenient_issubclass(first_field.type_, BaseModel):
+            fields_to_extract = get_cached_model_fields(first_field.type_)
+            single_not_embedded_field = True
+            # If headers are in a Pydantic model, the way to disable convert_underscores
+            # would be with Header(convert_underscores=False) at the Pydantic model level
+            default_convert_underscores = getattr(
+                first_field.field_info, "convert_underscores", True
+            )
+
+        params_to_process: Dict[str, Any] = {}
+
+        processed_keys = set()
+
+        for field in fields_to_extract:
+            alias = None
+            if isinstance(received_params, Headers):
+                # Handle fields extracted from a Pydantic Model for a header, each field
+                # doesn't have a FieldInfo of type Header with the default convert_underscores=True
+                convert_underscores = getattr(
+                    field.field_info, "convert_underscores", default_convert_underscores
+                )
+                if convert_underscores:
+                    alias = (
+                        field.alias
+                        if field.alias != field.name
+                        else field.name.replace("_", "-")
+                    )
+            value = _get_multidict_value(field, received_params, alias=alias)
+            if value is not None:
+                params_to_process[field.name] = value
+            processed_keys.add(alias or field.alias)
+            processed_keys.add(field.name)
+
+        for key, value in received_params.items():
+            if key not in processed_keys:
+                params_to_process[key] = value
+
+        if single_not_embedded_field:
+            field_info = first_field.field_info
+            assert isinstance(field_info, (params.Param, temp_pydantic_v1_params.Param)), (
+                "Params must be subclasses of Param"
+            )
+            loc: Tuple[str, ...] = (field_info.in_.value,)
+            v_, errors_ = _validate_value_with_model_field(
+                field=first_field, value=params_to_process, values=values, loc=loc
+            )
+
+            # Track validation errors
+            if METRICS_DEPENDENCIES and errors_:
+                error_tags = tags + [f"error_count:{len(errors_)}"]
+                statsd.increment("request_params_to_args.validation_errors", tags=error_tags)
+
+            return {first_field.name: v_}, errors_
+
+        for field in fields:
+            value = _get_multidict_value(field, received_params)
+            field_info = field.field_info
+            assert isinstance(field_info, (params.Param, temp_pydantic_v1_params.Param)), (
+                "Params must be subclasses of Param"
+            )
+            loc = (field_info.in_.value, field.alias)
+            v_, errors_ = _validate_value_with_model_field(
+                field=field, value=value, values=values, loc=loc
+            )
+            if errors_:
+                errors.extend(errors_)
+            else:
+                values[field.name] = v_
+
+        # Track validation errors
+        if METRICS_DEPENDENCIES and errors:
+            error_tags = tags + [f"error_count:{len(errors)}"]
+            statsd.increment("request_params_to_args.validation_errors", tags=error_tags)
+
         return values, errors
 
-    first_field = fields[0]
-    fields_to_extract = fields
-    single_not_embedded_field = False
-    default_convert_underscores = True
-    if len(fields) == 1 and lenient_issubclass(first_field.type_, BaseModel):
-        fields_to_extract = get_cached_model_fields(first_field.type_)
-        single_not_embedded_field = True
-        # If headers are in a Pydantic model, the way to disable convert_underscores
-        # would be with Header(convert_underscores=False) at the Pydantic model level
-        default_convert_underscores = getattr(
-            first_field.field_info, "convert_underscores", True
-        )
+    except Exception as e:
+        if METRICS_DEPENDENCIES:
+            error_tags = tags + [f"error_type:{type(e).__name__}"]
+            statsd.increment("request_params_to_args.errors", tags=error_tags)
+        raise
 
-    params_to_process: Dict[str, Any] = {}
-
-    processed_keys = set()
-
-    for field in fields_to_extract:
-        alias = None
-        if isinstance(received_params, Headers):
-            # Handle fields extracted from a Pydantic Model for a header, each field
-            # doesn't have a FieldInfo of type Header with the default convert_underscores=True
-            convert_underscores = getattr(
-                field.field_info, "convert_underscores", default_convert_underscores
-            )
-            if convert_underscores:
-                alias = (
-                    field.alias
-                    if field.alias != field.name
-                    else field.name.replace("_", "-")
-                )
-        value = _get_multidict_value(field, received_params, alias=alias)
-        if value is not None:
-            params_to_process[field.name] = value
-        processed_keys.add(alias or field.alias)
-        processed_keys.add(field.name)
-
-    for key, value in received_params.items():
-        if key not in processed_keys:
-            params_to_process[key] = value
-
-    if single_not_embedded_field:
-        field_info = first_field.field_info
-        assert isinstance(field_info, (params.Param, temp_pydantic_v1_params.Param)), (
-            "Params must be subclasses of Param"
-        )
-        loc: Tuple[str, ...] = (field_info.in_.value,)
-        v_, errors_ = _validate_value_with_model_field(
-            field=first_field, value=params_to_process, values=values, loc=loc
-        )
-        return {first_field.name: v_}, errors_
-
-    for field in fields:
-        value = _get_multidict_value(field, received_params)
-        field_info = field.field_info
-        assert isinstance(field_info, (params.Param, temp_pydantic_v1_params.Param)), (
-            "Params must be subclasses of Param"
-        )
-        loc = (field_info.in_.value, field.alias)
-        v_, errors_ = _validate_value_with_model_field(
-            field=field, value=value, values=values, loc=loc
-        )
-        if errors_:
-            errors.extend(errors_)
-        else:
-            values[field.name] = v_
-    return values, errors
+    finally:
+        if METRICS_DEPENDENCIES:
+            duration = time.time() - start_time
+            statsd.histogram("request_params_to_args.latency", duration, tags=tags)
 
 
 def is_union_of_base_models(field_type: Any) -> bool:
@@ -940,49 +1063,100 @@ async def request_body_to_args(
     received_body: Optional[Union[Dict[str, Any], FormData]],
     embed_body_fields: bool,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    values: Dict[str, Any] = {}
-    errors: List[Dict[str, Any]] = []
-    assert body_fields, "request_body_to_args() should be called with fields"
-    single_not_embedded_field = len(body_fields) == 1 and not embed_body_fields
-    first_field = body_fields[0]
-    body_to_process = received_body
+    from fastapi.observability.config import METRICS_DEPENDENCIES
+    from fastapi.observability.metrics import statsd
+    import time
+    import sys
 
-    fields_to_extract: List[ModelField] = body_fields
+    # Determine body type
+    body_type = "none"
+    if received_body is not None:
+        body_type = "form" if isinstance(received_body, FormData) else "json"
 
-    if (
-        single_not_embedded_field
-        and _is_model_class(first_field.type_)
-        and isinstance(received_body, FormData)
-    ):
-        fields_to_extract = get_cached_model_fields(first_field.type_)
+    field_count = len(body_fields)
+    tags = [
+        f"body_type:{body_type}",
+        f"field_count:{field_count}",
+        f"embedded:{embed_body_fields}"
+    ]
 
-    if isinstance(received_body, FormData):
-        body_to_process = await _extract_form_body(fields_to_extract, received_body)
+    start_time = time.time()
+    if METRICS_DEPENDENCIES:
+        statsd.increment("request_body_to_args.count", tags=tags)
 
-    if single_not_embedded_field:
-        loc: Tuple[str, ...] = ("body",)
-        v_, errors_ = _validate_value_with_model_field(
-            field=first_field, value=body_to_process, values=values, loc=loc
-        )
-        return {first_field.name: v_}, errors_
-    for field in body_fields:
-        loc = ("body", field.alias)
-        value: Optional[Any] = None
-        if body_to_process is not None:
-            try:
-                value = body_to_process.get(field.alias)
-            # If the received body is a list, not a dict
-            except AttributeError:
-                errors.append(get_missing_field_error(loc))
-                continue
-        v_, errors_ = _validate_value_with_model_field(
-            field=field, value=value, values=values, loc=loc
-        )
-        if errors_:
-            errors.extend(errors_)
-        else:
-            values[field.name] = v_
-    return values, errors
+        # Track body size if available
+        if received_body is not None:
+            body_size = sys.getsizeof(received_body)
+            statsd.histogram("request_body_to_args.body_size", body_size, tags=tags)
+
+    try:
+        values: Dict[str, Any] = {}
+        errors: List[Dict[str, Any]] = []
+        assert body_fields, "request_body_to_args() should be called with fields"
+        single_not_embedded_field = len(body_fields) == 1 and not embed_body_fields
+        first_field = body_fields[0]
+        body_to_process = received_body
+
+        fields_to_extract: List[ModelField] = body_fields
+
+        if (
+            single_not_embedded_field
+            and _is_model_class(first_field.type_)
+            and isinstance(received_body, FormData)
+        ):
+            fields_to_extract = get_cached_model_fields(first_field.type_)
+
+        if isinstance(received_body, FormData):
+            body_to_process = await _extract_form_body(fields_to_extract, received_body)
+
+        if single_not_embedded_field:
+            loc: Tuple[str, ...] = ("body",)
+            v_, errors_ = _validate_value_with_model_field(
+                field=first_field, value=body_to_process, values=values, loc=loc
+            )
+
+            # Track validation errors
+            if METRICS_DEPENDENCIES and errors_:
+                error_tags = tags + [f"error_count:{len(errors_)}"]
+                statsd.increment("request_body_to_args.validation_errors", tags=error_tags)
+
+            return {first_field.name: v_}, errors_
+
+        for field in body_fields:
+            loc = ("body", field.alias)
+            value: Optional[Any] = None
+            if body_to_process is not None:
+                try:
+                    value = body_to_process.get(field.alias)
+                # If the received body is a list, not a dict
+                except AttributeError:
+                    errors.append(get_missing_field_error(loc))
+                    continue
+            v_, errors_ = _validate_value_with_model_field(
+                field=field, value=value, values=values, loc=loc
+            )
+            if errors_:
+                errors.extend(errors_)
+            else:
+                values[field.name] = v_
+
+        # Track validation errors
+        if METRICS_DEPENDENCIES and errors:
+            error_tags = tags + [f"error_count:{len(errors)}"]
+            statsd.increment("request_body_to_args.validation_errors", tags=error_tags)
+
+        return values, errors
+
+    except Exception as e:
+        if METRICS_DEPENDENCIES:
+            error_tags = tags + [f"error_type:{type(e).__name__}"]
+            statsd.increment("request_body_to_args.errors", tags=error_tags)
+        raise
+
+    finally:
+        if METRICS_DEPENDENCIES:
+            duration = time.time() - start_time
+            statsd.histogram("request_body_to_args.latency", duration, tags=tags)
 
 
 def get_body_field(
